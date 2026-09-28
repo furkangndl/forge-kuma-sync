@@ -11,7 +11,7 @@ from uptime_kuma_api import UptimeKumaApi, MonitorType
 FORGE_API = "https://forge.laravel.com/api"
 REQUEST_DELAY = 1
 MONITOR_INTERVAL = 60
-MONITOR_RETRIES = 1
+MONITOR_RETRIES = 3
 
 
 class Forge:
@@ -129,6 +129,9 @@ def sync(api, sites: dict, notification_ids: list, delete_missing: bool):
 
     for url, name in sorted(sites.items(), key=lambda x: x[1]):
         if url in existing:
+            monitor = existing[url]
+            if monitor.get("type") == MonitorType.HTTP and monitor.get("maxretries") != MONITOR_RETRIES:
+                api.edit_monitor(monitor["id"], maxretries=MONITOR_RETRIES)
             continue
 
         if not reachable(url):
