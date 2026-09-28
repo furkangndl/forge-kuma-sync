@@ -6,7 +6,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dotenv import load_dotenv
-from uptime_kuma_api import UptimeKumaApi, MonitorType
+from uptime_kuma_api import UptimeKumaApi, MonitorType, Event
 
 FORGE_API = "https://forge.laravel.com/api"
 REQUEST_DELAY = 1
@@ -158,6 +158,13 @@ def sync(api, sites: dict, notification_ids: list, delete_missing: bool):
         api.delete_monitor(m["id"])
 
 
+def login(api, username: str, password: str):
+    """info geldikten sonra login atar. Kuma login dinleyicisini ondan sonra takiyor."""
+    with api.wait_for_event(Event.INFO):
+        pass
+    return api.login(username, password)
+
+
 def main():
     load_dotenv()
 
@@ -171,7 +178,7 @@ def main():
 
     api = UptimeKumaApi(os.getenv("KUMA_URL"))
     try:
-        api.login(os.getenv("KUMA_USERNAME"), os.getenv("KUMA_PASSWORD"))
+        login(api, os.getenv("KUMA_USERNAME"), os.getenv("KUMA_PASSWORD"))
         notif = notification_ids(api, os.getenv("KUMA_NOTIFICATION_NAME"))
         sync(api, sites, notif, delete_missing=complete)
     finally:
