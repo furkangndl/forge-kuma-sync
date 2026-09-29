@@ -18,6 +18,7 @@ FORGE_API = "https://forge.laravel.com/api"
 REQUEST_DELAY = 1
 MONITOR_INTERVAL = 60
 MONITOR_RETRIES = 3
+ACCEPTED_STATUSCODES = ["200-299", "400-499"]
 
 
 class Forge:
@@ -111,14 +112,15 @@ def collect_sites(forge: Forge) -> tuple[dict, bool]:
 
 
 def reachable(url: str) -> bool:
-    """Kuma ile ayni kural: yonlendirme sonrasi cevap 200-299 ise site eklenir."""
+    """Yonlendirme sonrasi cevap 2xx veya 4xx ise site eklenir."""
     session = requests.Session()
     session.max_redirects = 10
     try:
         response = session.get(url, timeout=30, allow_redirects=True)
     except requests.RequestException:
         return False
-    return 200 <= response.status_code < 300
+    code = response.status_code
+    return (200 <= code < 300) or (400 <= code < 500)
 
 
 def notification_ids(api, name: str) -> list:
@@ -136,8 +138,15 @@ def sync(api, sites: dict, notification_ids: list, delete_missing: bool):
     for url, name in sorted(sites.items(), key=lambda x: x[1]):
         if url in existing:
             monitor = existing[url]
-            if monitor.get("type") == MonitorType.HTTP and monitor.get("maxretries") != MONITOR_RETRIES:
-                api.edit_monitor(monitor["id"], maxretries=MONITOR_RETRIES)
+            if monitor.get("type") == MonitorType.HTTP:
+                edits = {}
+                if monitor.get("maxretries") != MONITOR_RETRIES:
+                    edits["maxretries"] = MONITOR_RETRIES
+                codes = monitor.get("accepted_statuscodes") or []
+                if "400-499" not in codes:
+                    edits["accepted_statuscodes"] = ACCEPTED_STATUSCODES if not codes else [*codes, "400-499"]
+                if edits:
+                    api.edit_monitor(monitor["id"], **edits)
             continue
 
         if not reachable(url):
@@ -150,6 +159,7 @@ def sync(api, sites: dict, notification_ids: list, delete_missing: bool):
             interval=MONITOR_INTERVAL,
             maxretries=MONITOR_RETRIES,
             retryInterval=MONITOR_INTERVAL,
+            accepted_statuscodes=ACCEPTED_STATUSCODES,
             notificationIDList=notification_ids,
         )
 
