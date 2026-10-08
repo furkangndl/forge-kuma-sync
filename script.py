@@ -20,7 +20,7 @@ FORGE_API = "https://forge.laravel.com/api"
 REQUEST_DELAY = 1
 MONITOR_INTERVAL = 60
 MONITOR_RETRIES = 3
-ACCEPTED_STATUSCODES = ["200-299", "401", "403"]
+ACCEPTED_STATUSCODES = ["200-299", "401"]
 NO_RESPONSE_TAG = "no-response"
 HEALTH_ROUTES = ["/up", "/api/health-check", "/health", "/ping"]
 ROUTE_TIMEOUT = 10
@@ -154,13 +154,13 @@ def base_url(url: str) -> str:
     return f"{p.scheme}://{(p.hostname or '').lower()}"
 
 
-def find_health_route(url: str) -> str:
-    """Ilk gercek health route'unu dondurur; yoksa site url'sini. Kok ile ayni govdeyi
-    donen (SPA/catch-all) route'lar gercek sayilmaz."""
+def find_health_route(url: str):
+    """Ilk gercek health route'unu dondurur; yoksa site url'sini, site hic cevap vermiyorsa None.
+    Kok ile ayni govdeyi donen (SPA/catch-all) route'lar gercek sayilmaz."""
     try:
         root = requests.get(url, timeout=ROUTE_TIMEOUT, allow_redirects=True)
     except requests.RequestException:
-        return url
+        return None
     root_body = root.text if root.ok else None
 
     for route in HEALTH_ROUTES:
@@ -215,6 +215,8 @@ def sync(api, sites: dict, notification_ids: list, delete_missing: bool):
     for site_url, name in sorted(sites.items(), key=lambda x: x[1]):
         url = targets[site_url]
         base = base_url(site_url)
+        if url is None:
+            continue
         if base in existing:
             monitor = existing[base]
             if monitor.get("type") == MonitorType.HTTP:
