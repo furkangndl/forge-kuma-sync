@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+from urllib.parse import urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -18,7 +19,27 @@ FORGE_API = "https://forge.laravel.com/api"
 REQUEST_DELAY = 1
 MONITOR_INTERVAL = 60
 MONITOR_RETRIES = 3
-ACCEPTED_STATUSCODES = ["200-299", "400-499"]
+ACCEPTED_STATUSCODES = ["200-299"]
+NO_RESPONSE_TAG = "no-response"
+ALLOWLIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "allowlist.txt")
+
+
+def load_allowlist(path: str = ALLOWLIST_PATH) -> set:
+    """Her satirda bir domain; bos satir ve # yorumlari atlanir."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = [line.split("#", 1)[0].strip().lower() for line in f]
+    except FileNotFoundError:
+        return set()
+    return {line for line in lines if line}
+
+
+def is_allowed(url: str, allowed: set) -> bool:
+    """Host, allowlist'teki domainin kendisi veya alt domaini ise True; allowlist bossa hepsi."""
+    if not allowed:
+        return True
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == d or host.endswith("." + d) for d in allowed)
 
 
 class Forge:
@@ -60,7 +81,7 @@ class Forge:
         )
 
 
-def collect_sites(forge: Forge) -> tuple[dict, bool]:
+def collect_sites(forge: Forge, allowed: set) -> tuple[dict, bool]:
     """{url: name} ve listenin eksiksiz olup olmadigini dondurur."""
     found = {}
     complete = True
@@ -103,7 +124,7 @@ def collect_sites(forge: Forge) -> tuple[dict, bool]:
                     continue
 
                 url = (sa.get("url") or "").strip().rstrip("/")
-                if not url:
+                if not url or not is_allowed(url, allowed):
                     continue
 
                 found[url] = sa["name"]
@@ -111,24 +132,46 @@ def collect_sites(forge: Forge) -> tuple[dict, bool]:
     return found, complete
 
 
-def reachable(url: str) -> bool:
-    """Yonlendirme sonrasi cevap 2xx veya 4xx ise site eklenir."""
-    session = requests.Session()
-    session.max_redirects = 10
-    try:
-        response = session.get(url, timeout=30, allow_redirects=True)
-    except requests.RequestException:
-        return False
-    code = response.status_code
-    return (200 <= code < 300) or (400 <= code < 500)
-
-
 def notification_ids(api, name: str) -> list:
     """Kuma'da adi birebir eslesen tum bildirimlerin id'sini dondurur."""
     return [n["id"] for n in api.get_notifications() if n.get("name") == name]
 
 
+def fetch_status(url: str) -> str:
+    """Yonlendirmeler takip edilir; son cevabin status kodunu veya no-response dondurur."""
+    try:
+        return str(requests.get(url, timeout=30, allow_redirects=True).status_code)
+    except requests.RequestException:
+        return NO_RESPONSE_TAG
+
+
+def is_status_tag(name) -> bool:
+    return name == NO_RESPONSE_TAG or (name or "").isdigit()
+
+
+def status_color(name: str) -> str:
+    return {"2": "#059669", "3": "#2563EB", "4": "#D97706", "5": "#DC2626"}.get(name[:1], "#4B5563")
+
+
+def apply_status_tag(api, tags: dict, monitor: dict, url: str):
+    """Monitorun status tag'ini guncel koda ceker; eskileri kaldirir."""
+    name = fetch_status(url)
+    if name not in tags:
+        tags[name] = api.add_tag(name=name, color=status_color(name))["id"]
+    tag_id = tags[name]
+
+    present = False
+    for t in monitor.get("tags") or []:
+        if t.get("tag_id") == tag_id:
+            present = True
+        elif is_status_tag(t.get("name")):
+            api.delete_monitor_tag(tag_id=t["tag_id"], monitor_id=monitor["id"], value=t.get("value", ""))
+    if not present:
+        api.add_monitor_tag(tag_id=tag_id, monitor_id=monitor["id"])
+
+
 def sync(api, sites: dict, notification_ids: list, delete_missing: bool):
+    tags = {t["name"]: t["id"] for t in api.get_tags()}
     existing = {}
     for m in api.get_monitors():
         url = (m.get("url") or "").rstrip("/")
@@ -142,17 +185,16 @@ def sync(api, sites: dict, notification_ids: list, delete_missing: bool):
                 edits = {}
                 if monitor.get("maxretries") != MONITOR_RETRIES:
                     edits["maxretries"] = MONITOR_RETRIES
-                codes = monitor.get("accepted_statuscodes") or []
-                if "400-499" not in codes:
-                    edits["accepted_statuscodes"] = ACCEPTED_STATUSCODES if not codes else [*codes, "400-499"]
+                if monitor.get("accepted_statuscodes") != ACCEPTED_STATUSCODES:
+                    edits["accepted_statuscodes"] = ACCEPTED_STATUSCODES
+                if not notification_ids and any((monitor.get("notificationIDList") or {}).values()):
+                    edits["notificationIDList"] = {}
                 if edits:
                     api.edit_monitor(monitor["id"], **edits)
+            apply_status_tag(api, tags, monitor, url)
             continue
 
-        if not reachable(url):
-            continue
-
-        api.add_monitor(
+        added = api.add_monitor(
             type=MonitorType.HTTP,
             name=name,
             url=url,
@@ -162,6 +204,7 @@ def sync(api, sites: dict, notification_ids: list, delete_missing: bool):
             accepted_statuscodes=ACCEPTED_STATUSCODES,
             notificationIDList=notification_ids,
         )
+        apply_status_tag(api, tags, {"id": added["monitorID"]}, url)
 
     if not delete_missing:
         return
@@ -177,20 +220,23 @@ def sync(api, sites: dict, notification_ids: list, delete_missing: bool):
 def main():
     load_dotenv()
 
-    required = ["FORGE_API_TOKEN", "KUMA_URL", "KUMA_USERNAME", "KUMA_PASSWORD", "KUMA_NOTIFICATION_NAME"]
+    required = ["FORGE_API_TOKEN", "KUMA_URL", "KUMA_USERNAME", "KUMA_PASSWORD"]
     missing = [k for k in required if not os.getenv(k)]
     if missing:
         sys.exit(1)
 
+    allowed = load_allowlist()
+
     forge = Forge(os.getenv("FORGE_API_TOKEN"))
-    sites, complete = collect_sites(forge)
+    sites, complete = collect_sites(forge, allowed)
 
     api = UptimeKumaApi(os.getenv("KUMA_URL"))
     try:
         with api.wait_for_event(Event.INFO):
             pass
         api.login(os.getenv("KUMA_USERNAME"), os.getenv("KUMA_PASSWORD"))
-        notif = notification_ids(api, os.getenv("KUMA_NOTIFICATION_NAME"))
+        notif_name = (os.getenv("KUMA_NOTIFICATION_NAME") or "").strip()
+        notif = notification_ids(api, notif_name) if notif_name else []
         sync(api, sites, notif, delete_missing=complete)
     finally:
         api.disconnect()
