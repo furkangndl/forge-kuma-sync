@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import requests
@@ -19,8 +20,11 @@ FORGE_API = "https://forge.laravel.com/api"
 REQUEST_DELAY = 1
 MONITOR_INTERVAL = 60
 MONITOR_RETRIES = 3
-ACCEPTED_STATUSCODES = ["200-299"]
+ACCEPTED_STATUSCODES = ["200-299", "401", "403"]
 NO_RESPONSE_TAG = "no-response"
+HEALTH_ROUTES = ["/up", "/api/health-check", "/health", "/ping"]
+ROUTE_TIMEOUT = 10
+ROUTE_WORKERS = 8
 ALLOWLIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "allowlist.txt")
 
 
@@ -145,6 +149,33 @@ def fetch_status(url: str) -> str:
         return NO_RESPONSE_TAG
 
 
+def base_url(url: str) -> str:
+    p = urlparse(url)
+    return f"{p.scheme}://{(p.hostname or '').lower()}"
+
+
+def find_health_route(url: str) -> str:
+    """Ilk gercek health route'unu dondurur; yoksa site url'sini. Kok ile ayni govdeyi
+    donen (SPA/catch-all) route'lar gercek sayilmaz."""
+    try:
+        root = requests.get(url, timeout=ROUTE_TIMEOUT, allow_redirects=True)
+    except requests.RequestException:
+        return url
+    root_body = root.text if root.ok else None
+
+    for route in HEALTH_ROUTES:
+        try:
+            r = requests.get(url + route, timeout=ROUTE_TIMEOUT, allow_redirects=True)
+        except requests.RequestException:
+            continue
+        if r.status_code != 200:
+            continue
+        if root_body is not None and r.text == root_body:
+            continue
+        return url + route
+    return url
+
+
 def is_status_tag(name) -> bool:
     return name == NO_RESPONSE_TAG or (name or "").isdigit()
 
@@ -176,16 +207,23 @@ def sync(api, sites: dict, notification_ids: list, delete_missing: bool):
     for m in api.get_monitors():
         url = (m.get("url") or "").rstrip("/")
         if url:
-            existing[url] = m
+            existing[base_url(url)] = m
 
-    for url, name in sorted(sites.items(), key=lambda x: x[1]):
-        if url in existing:
-            monitor = existing[url]
+    with ThreadPoolExecutor(ROUTE_WORKERS) as pool:
+        targets = dict(zip(sites, pool.map(find_health_route, sites)))
+
+    for site_url, name in sorted(sites.items(), key=lambda x: x[1]):
+        url = targets[site_url]
+        base = base_url(site_url)
+        if base in existing:
+            monitor = existing[base]
             if monitor.get("type") == MonitorType.HTTP:
                 edits = {}
+                if (monitor.get("url") or "").rstrip("/") != url:
+                    edits["url"] = url
                 if monitor.get("maxretries") != MONITOR_RETRIES:
                     edits["maxretries"] = MONITOR_RETRIES
-                if monitor.get("accepted_statuscodes") != ACCEPTED_STATUSCODES:
+                if sorted(monitor.get("accepted_statuscodes") or []) != sorted(ACCEPTED_STATUSCODES):
                     edits["accepted_statuscodes"] = ACCEPTED_STATUSCODES
                 if not notification_ids and monitor.get("notificationIDList"):
                     edits["notificationIDList"] = {}
@@ -209,8 +247,9 @@ def sync(api, sites: dict, notification_ids: list, delete_missing: bool):
     if not delete_missing:
         return
 
-    for url, m in existing.items():
-        if url in sites:
+    site_bases = {base_url(u) for u in sites}
+    for base, m in existing.items():
+        if base in site_bases:
             continue
         if m.get("type") != MonitorType.HTTP:
             continue
