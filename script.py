@@ -187,7 +187,7 @@ def sync(api, sites: dict, notification_ids: list, delete_missing: bool):
                     edits["maxretries"] = MONITOR_RETRIES
                 if monitor.get("accepted_statuscodes") != ACCEPTED_STATUSCODES:
                     edits["accepted_statuscodes"] = ACCEPTED_STATUSCODES
-                if not notification_ids and any((monitor.get("notificationIDList") or {}).values()):
+                if not notification_ids and monitor.get("notificationIDList"):
                     edits["notificationIDList"] = {}
                 if edits:
                     api.edit_monitor(monitor["id"], **edits)
